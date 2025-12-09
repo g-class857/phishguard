@@ -64,28 +64,29 @@ def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
     headers = parts[0] if len(parts) > 0 else ''
     body = parts[1] if len(parts) > 1 else headers #Handles edge cases: If no blank line, treat everything as body
     
-    # Extract subject for additional features
-    subject_match = re.search(r'Subject:\s*(.*?)(?:\n|$)', headers, re.IGNORECASE | re.DOTALL)
-    subject = subject_match.group(1).strip() if subject_match else ''
+    # Extract subject for additional features: capture until newline or end (?:\n|$) , 
+    subject_match = re.search(r'Subject:\s*(.*?)(?:\n|$)', headers, re.IGNORECASE | re.DOTALL) # re.DOTALL make . matches newline
+    subject = subject_match.group(1).strip() if subject_match else '' # search for subject and read after it, strip white spaces till the end or new line
     features['subject_length'] = len(subject)
     features['subject_has_urgent'] = 1.0 if re.search(urgent_pattern, subject, re.IGNORECASE) else 0.0
     
     # === 4. CLEAN BODY TEXT FOR TF-IDF ANALYSIS ===
     # Remove HTML tags but preserve their text content
+    # Remove JavaScript, CSS and style (malicious or irrelevant for text analysis)
     body = re.sub(r'<script.*?</script>', ' ', body, flags=re.IGNORECASE | re.DOTALL)
     body = re.sub(r'<style.*?</style>', ' ', body, flags=re.IGNORECASE | re.DOTALL)
-    body = re.sub(r'<[^>]+>', ' ', body)
+    body = re.sub(r'<[^>]+>', ' ', body) # Remove remaining HTML tags but keep text content
     
-    # Replace specific patterns with tokens (helps model learn patterns, not specifics)
-    body = re.sub(r'https?://[^\s<>"\']+|www\.[^\s<>"\']+', ' URL_TOKEN ', body, flags=re.IGNORECASE)
-    body = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', ' EMAIL_TOKEN ', body)
-    body = re.sub(r'\$\d+(?:\.\d{1,2})?|\d+\s*(?:dollars?|usd|eur|gbp)\b', ' MONEY_TOKEN ', body, flags=re.IGNORECASE)
+    # Replace specific patterns with tokens (helps model learn patterns without memorizing specific ones)
+    body = re.sub(r'https?://[^\s<>"\']+|www\.[^\s<>"\']+', ' URL_TOKEN ', body, flags=re.IGNORECASE) # URL pattern
+    body = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', ' EMAIL_TOKEN ', body) # email pattern
+    body = re.sub(r'\$\d+(?:\.\d{1,2})?|\d+\s*(?:dollars?|usd|eur|gbp)\b', ' MONEY_TOKEN ', body, flags=re.IGNORECASE) # money pattern
     body = re.sub(r'\b\d{10,}\b', ' NUMBER_TOKEN ', body)  # Long numbers (like phone/account)
     
-    # Remove remaining special characters but keep basic sentence structure
+    # Remove remaining special characters but keep basic senence structure
     body = re.sub(r'[^\w\s\.\,\!\?]', ' ', body)
     
-    # Normalize whitespace and convert to lowercase
+    # Normalization: split on whitespaces and rejoin with single one and convert to lowercase
     body = ' '.join(body.split())
     cleaned_text = body.lower().strip()
     
@@ -96,7 +97,7 @@ def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
     return cleaned_text, features
 
 # ==================== BATCH PROCESSING FUNCTION ====================
-def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]: # process multiple emails efficiently, used in training and batch prediction
     """
     Process a batch of raw emails for training or batch prediction.
     
@@ -111,12 +112,12 @@ def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]
     cleaned_texts = []
     features_list = []
     
-    for email in raw_emails:
+    for email in raw_emails: # iterate through emails and collecting results
         cleaned_text, features = preprocess_email(email)
         cleaned_texts.append(cleaned_text)
         features_list.append(features)
     
-    # Create DataFrames with consistent column order
+    # Create DataFrames with consistent column order. DataFrames are Compatible with scikit-learn and pandas pipelines
     text_df = pd.DataFrame({'cleaned_text': cleaned_texts})
     features_df = pd.DataFrame(features_list)
     
@@ -136,12 +137,14 @@ def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]
     features_df = features_df[expected_features]
     
     return text_df, features_df
-
+    #  Ensures consistent feature set across all emails, Some emails might not have certain features (e.g., no subject), but ML models expect same columns
 # ==================== INTEGRATION WITH PIPELINE ====================
 def create_preprocessor():
     """
     Creates a scikit-learn compatible transformer for the preprocessing pipeline.
-    This is what you'll use in your ColumnTransformer.
+    This is what will be used in ColumnTransformer  with different processing for text vs numerical features.
+    FunctionTransformer: Wraps custom function into sklearn transformer
+    
     """
     from sklearn.preprocessing import FunctionTransformer
     
@@ -152,7 +155,7 @@ def create_preprocessor():
         result_df = pd.concat([text_df, features_df], axis=1)
         return result_df
     
-    return FunctionTransformer(transform_func, validate=False)
+    return FunctionTransformer(transform_func, validate=False) # validate=False: Skips sklearn input validation (we handle our own)
 
 # ==================== TEST THE FUNCTION ====================
 if __name__ == "__main__":
