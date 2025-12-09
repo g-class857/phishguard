@@ -4,10 +4,10 @@ Contains the core functions for preprocessing raw emails and extracting features
 This logic is used identically during training and in production.
 """
 
-import re
-import html
-from typing import Tuple, Dict, List
-import pandas as pd
+import re  # Regular expressions for pattern matching in text
+import html  # For handling HTML entities (like &amp;, &lt;)
+from typing import Tuple, Dict, List  # Type hints for function signatures
+import pandas as pd  # For batch processing and DataFrame creation
 
 # ==================== CORE PREPROCESSING FUNCTION ====================
 def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
@@ -26,41 +26,43 @@ def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
     
     # === 1. INITIAL CLEANING & DECODING ===
     # Handle HTML entities and common encoding artifacts
-    text = html.unescape(raw_email)
+    text = html.unescape(raw_email) # Converts HTML entities to characters (&amp; → &, &lt; → <)
     text = re.sub(r'=\s*\n', '', text)  # Remove soft line breaks (common in email encoding)
-    text = re.sub(r'=([A-F0-9]{2})', lambda m: chr(int(m.group(1), 16)), text)  # Decode hex chars like =2E
+    text = re.sub(r'=([A-F0-9]{2})', lambda m: chr(int(m.group(1), 16)), text)  # Decode hex chars to integers then to chars, lambda is anonymous function and m is parameter. chr(int("41", 16), text) -> A
     
     # === 2. EXTRACT STRUCTURAL FEATURES (BEFORE MODIFYING TEXT) ===
     # These features are crucial for phishing detection and are extracted from the raw text
     features = {}
     
     # Link/URL features
-    url_pattern = r'https?://[^\s<>"\']+|www\.[^\s<>"\']+'
-    urls = re.findall(url_pattern, text, re.IGNORECASE)
-    features['num_links'] = len(urls)
-    features['has_url'] = 1.0 if features['num_links'] > 0 else 0.0
+    url_pattern = r'https?://[^\s<>"\']+|www\.[^\s<>"\']+' # Matches http/https URLs and www addresses
+    urls = re.findall(url_pattern, text, re.IGNORECASE) 
+    features['num_links'] = len(urls) # phishing links usually has long characters
+    features['has_url'] = 1.0 if features['num_links'] > 0 else 0.0 # does the email has a link or not
     
-    # Urgency and tone features
-    urgent_keywords = ['urgent', 'immediate', 'asap', 'action required', 'verify', 'suspend', 'account', 'security', 'alert']
-    urgent_pattern = r'\b(' + '|'.join(urgent_keywords) + r')\b'
-    features['has_urgent_keyword'] = 1.0 if re.search(urgent_pattern, text, re.IGNORECASE) else 0.0
+    # Urgency and tone features: Detects common psychological pressure tactics in phishing
+    urgent_keywords = ['urgent', 'immediate', 'asap', 'action required', 'verify', 'suspend', 'account', 'security', 'alert'] 
+    urgent_pattern = r'\b(' + '|'.join(urgent_keywords) + r')\b' # \b: Word boundary (ensures whole word matching) 
+    features['has_urgent_keyword'] = 1.0 if re.search(urgent_pattern, text, re.IGNORECASE) else 0.0 # Checks if any urgent word appears in text (case-insensitive)
+
     features['num_exclamations'] = text.count('!')
     features['num_questions'] = text.count('?')
     
-    # Formatting features (common in phishing)
+    # Formatting features (common in phishing) 
+    # Pattern: < followed by non-> characters, then > .Detects HTML formatting (phishing emails often use HTML for legitimacy)
     features['has_html'] = 1.0 if bool(re.search(r'<[^>]+>', text)) else 0.0
-    features['all_caps_ratio'] = len(re.findall(r'\b[A-Z]{2,}\b', text)) / max(len(re.findall(r'\b[A-Za-z]+\b', text)), 1)
+    features['all_caps_ratio'] = len(re.findall(r'\b[A-Z]{2,}\b', text)) / max(len(re.findall(r'\b[A-Za-z]+\b', text)), 1) # Words with 2+ uppercase letters common in phishing
     
     # Structural features
     features['body_length'] = len(text)
-    features['num_recipients'] = len(re.findall(r'To:|CC:|BCC:', text, re.IGNORECASE))
-    features['has_attachment_keyword'] = 1.0 if re.search(r'\b(attachment|attached|enclosed)\b', text, re.IGNORECASE) else 0.0
+    features['num_recipients'] = len(re.findall(r'To:|CC:|BCC:', text, re.IGNORECASE)) # Counts recipient fields (mass emails might indicate spam)
+    features['has_attachment_keyword'] = 1.0 if re.search(r'\b(attachment|attached|enclosed)\b', text, re.IGNORECASE) else 0.0 #Detects mention of attachments
     
     # === 3. SEPARATE HEADERS FROM BODY ===
     # Find the first empty line (standard email header-body separator)
-    parts = re.split(r'\n\s*\n', text, maxsplit=1)
+    parts = re.split(r'\n\s*\n', text, maxsplit=1) # maxsplit=1 Only split on first occurrence
     headers = parts[0] if len(parts) > 0 else ''
-    body = parts[1] if len(parts) > 1 else headers
+    body = parts[1] if len(parts) > 1 else headers #Handles edge cases: If no blank line, treat everything as body
     
     # Extract subject for additional features
     subject_match = re.search(r'Subject:\s*(.*?)(?:\n|$)', headers, re.IGNORECASE | re.DOTALL)
