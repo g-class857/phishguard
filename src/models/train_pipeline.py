@@ -1,563 +1,673 @@
 """
-train_pipeline_fixed.py - Multi-Dataset Phishing Detector Training (fixed)
-Automatically detects and trains on all datasets in data/processed/
-
-Fixes:
-- Adaptive min_df / max_df for TfidfVectorizer to avoid "max_df corresponds to < documents than min_df" error
-- Minor preprocessing fixes (all-caps ratio computed before lowercasing)
-- create_full_pipeline accepts training size so TF-IDF thresholds are calculated safely
-- More robust handling of small datasets
+train_pipeline.py - Professional Phishing Detector Training
+Loads preprocessed data from manual_features.py and trains the model.
+Run from project root: `python src/models/train_pipeline.py`
 """
 
-import re
+import pandas as pd
+import numpy as np
+import joblib
 import json
 import sys
-import os
-import joblib
 import warnings
-import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
-
-import numpy as np
-import pandas as pd
+from typing import Dict, Any, Tuple, Optional
+from src.features import manual_features
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
-# sklearn
+# Scikit-learn components
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, f1_score
 
+# ==================== CONFIGURATION ====================
+class TrainingConfig:
+    """Centralized configuration for the training pipeline"""
+    
+    def __init__(self):
+        current_file = Path(__file__)
+        project_root = current_file.parent.parent.parent
+        
+        # Paths
+        self.PROJECT_ROOT = project_root
+        self.PREPROCESSED_DATA_PATH = project_root / 'data' / 'processed' / 'combined_training_data.csv'
+        self.MODEL_SAVE_PATH = project_root / 'models' / 'phishing_detector.pkl'
+        self.METRICS_SAVE_PATH = project_root / 'models' / 'training_metrics.json'
+        
+        # Training parameters
+        self.TEST_SIZE = 0.2
+        self.RANDOM_STATE = 42
+        self.CV_FOLDS = 5
+        
+        # TF-IDF parameters (FIXED: Adjusted to prevent "no terms remain" error)
+        self.TFIDF_MAX_FEATURES = 5000
+        self.TFIDF_NGRAM_RANGE = (1, 2)
+        self.TFIDF_MIN_DF = 2          # Minimum document frequency
+        self.TFIDF_MAX_DF = 0.95       # Maximum document frequency
+        self.TFIDF_STOP_WORDS = 'english'
+        
+        # Model parameters
+        self.N_ESTIMATORS = 100
+        self.CLASS_WEIGHT = 'balanced'
+        
+        # Feature selection
+        self.MIN_FEATURE_IMPORTANCE = 0.001
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary for saving"""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
 
-# ------------------ Preprocessing ------------------
-def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
-    """Process a single raw email string into cleaned text and numeric features."""
-    try:
-        original_text = str(raw_email)
-        # keep a version for detecting ALL CAPS words
-        words = original_text.split()
-        all_caps_ratio = sum(1 for w in words if w.isupper()) / max(len(words), 1)
+CONFIG = TrainingConfig()
 
-        # lowercased text for keyword searches and TF-IDF cleaning
-        text = original_text.lower()
+# ==================== DATA LOADER ====================
+class PreprocessedDataLoader:
+    """Loads and validates the preprocessed dataset from manual_features.py
 
-        features = {
-            'num_links': len([w for w in text.split() if 'http' in w or 'www.' in w]),
-            'body_length': len(text),
-            'has_urgent_keyword': 1 if any(word in text for word in ['urgent', 'immediate', 'verify', 'suspended', 'alert']) else 0,
-            'num_exclamations': text.count('!'),
-            'num_questions': text.count('?'),
-            'has_html': 1 if '<' in text and '>' in text else 0,
-            'all_caps_ratio': float(all_caps_ratio),
-            'has_url_keyword': 1 if any(word in text for word in ['click', 'link', 'http', 'www', '.com']) else 0,
-            'has_account_keyword': 1 if any(word in text for word in ['account', 'password', 'login', 'credentials']) else 0,
-            'has_money_keyword': 1 if any(sym in original_text for sym in ['$', 'money', 'cash', 'prize', 'winner', 'free']) else 0,
-        }
+    If the expected 'cleaned_text' column is missing but a 'raw_email' column
+    exists, this loader will call manual_features.preprocess_batch to generate
+    cleaned_text and the manual numeric features on-the-fly.
+    """
+    
+    def __init__(self, data_path: Path):
+        self.data_path = data_path
 
-        # Clean text for TF-IDF (keep only alphanumeric and basic punctuation)
-        cleaned_text = re.sub(r'[^a-zA-Z0-9\s.,!?]', ' ', text)
-        cleaned_text = ' '.join(cleaned_text.split())
-        if not cleaned_text.strip():
-            cleaned_text = "empty_email"
+        # Recommended/expected manual features produced by manual_features.py.
+        # These are optional: we will warn if missing but not crash (except cleaned_text/label).
+        self.optional_manual_features = [
+            'num_links', 'has_url', 'has_urgent_keyword', 'num_exclamations',
+            'num_questions', 'has_html', 'all_caps_ratio', 'body_length',
+            'num_recipients', 'has_attachment_keyword', 'subject_length',
+            'subject_has_urgent'
+        ]
+    
+    def load_and_validate(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+        """
+        Load preprocessed data and split into features and target.
 
-        return cleaned_text, features
-
-    except Exception as e:
-        print(f"Error in preprocess_email: {e}")
-        return "error_email", {
-            'num_links': 0, 'body_length': 0, 'has_urgent_keyword': 0,
-            'num_exclamations': 0, 'num_questions': 0, 'has_html': 0,
-            'all_caps_ratio': 0.0, 'has_url_keyword': 0, 'has_account_keyword': 0, 'has_money_keyword': 0
-        }
-
-
-def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    cleaned_texts = []
-    features_list = []
-
-    for email in raw_emails:
-        cleaned_text, features = preprocess_email(email)
-        cleaned_texts.append(cleaned_text)
-        features_list.append(features)
-
-    text_df = pd.DataFrame({'cleaned_text': cleaned_texts})
-    features_df = pd.DataFrame(features_list)
-
-    expected_features = [
-        'num_links', 'body_length', 'has_urgent_keyword', 'num_exclamations',
-        'num_questions', 'has_html', 'all_caps_ratio', 'has_url_keyword',
-        'has_account_keyword', 'has_money_keyword'
-    ]
-    for feat in expected_features:
-        if feat not in features_df.columns:
-            features_df[feat] = 0.0
-
-    return text_df, features_df
-
-
-# ------------------ Config ------------------
-
-def get_project_config() -> Dict[str, Any]:
-    current_file = Path(__file__)
-    project_root = current_file.parent.parent.parent
-
-    return {
-        'data_dir': project_root / 'data' / 'processed',
-        'model_save_path': project_root / 'models' / 'phishing_detector.pkl',
-        'metrics_save_path': project_root / 'models' / 'training_metrics.json',
-        'test_size': 0.2,
-        'random_state': 42,
-        'tfidf_max_features': 5000,
-        'n_estimators': 100,
-        'min_dataset_size': 10,
-        'max_datasets': 10,
-    }
-
-CONFIG = get_project_config()
-
-
-# ------------------ Dataset Loader ------------------
-class DatasetLoader:
-    def __init__(self, data_dir: Path):
-        self.data_dir = data_dir
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-    def detect_datasets(self) -> List[Path]:
-        dataset_files = []
-        dataset_files.extend(list(self.data_dir.glob("*.csv")))
-        dataset_files.extend(list(self.data_dir.glob("*.parquet")))
-        dataset_files.extend(list(self.data_dir.glob("*.json")))
-
-        print(f"Found {len(dataset_files)} dataset files:")
-        for i, file in enumerate(dataset_files, 1):
-            try:
-                size_kb = file.stat().st_size / 1024
-            except Exception:
-                size_kb = 0.0
-            print(f"  {i}. {file.name} ({size_kb:.1f} KB)")
-        return dataset_files
-
-    def load_single_dataset(self, filepath: Path) -> Tuple[pd.DataFrame, str, str]:
-        dataset_name = filepath.stem
+        Returns:
+            Tuple of (text_features_df, numeric_features_df, labels)
+        """
+        print("📥 Loading preprocessed data...")
+        
+        if not self.data_path.exists():
+            raise FileNotFoundError(
+                f"Preprocessed data not found at: {self.data_path}\n"
+                "Please run manual_features.py first to create the dataset, or "
+                "ensure your CSV includes a 'raw_email' column so this loader can preprocess it."
+            )
+        
+        # Load the data
+        df = pd.read_csv(self.data_path)
+        print(f"   Loaded {len(df):,} preprocessed emails")
+        print(f"   Available columns: {list(df.columns)}")
+        
+        # If cleaned_text is missing but raw_email exists, generate preprocessing now
+        if 'cleaned_text' not in df.columns:
+            if 'raw_email' in df.columns:
+                print("ℹ️  'cleaned_text' missing but 'raw_email' found — generating cleaned_text and manual features using manual_features.preprocess_batch(...)")
+               
+                
+                # Ensure raw_email column is string
+                raw_emails = df['raw_email'].astype(str).tolist()
+                text_df, features_df = manual_features.preprocess_batch(raw_emails)
+                
+                # Merge generated data into original df (preserve label and other columns)
+                df = pd.concat([df.reset_index(drop=True), text_df.reset_index(drop=True), features_df.reset_index(drop=True)], axis=1)
+                print("   ✅ Generated and merged cleaned_text + manual features into DataFrame.")
+            else:
+                # Neither cleaned_text nor raw_email present: cannot proceed
+                raise ValueError("Dataset must contain 'cleaned_text' column or a 'raw_email' column to generate it.")
+        
+        # Basic checks: cleaned_text and label must exist now
+        if 'cleaned_text' not in df.columns:
+            raise ValueError("Dataset must contain 'cleaned_text' column")
+        if 'label' not in df.columns:
+            raise ValueError("Dataset must contain 'label' column")
+        
+        # Warn about optional manual features that are missing
+        missing_optional = [c for c in self.optional_manual_features if c not in df.columns]
+        if missing_optional:
+            print(f"⚠️  Warning: Optional/manual feature columns missing: {missing_optional}")
+        
+        # Split data
+        text_features = df[['cleaned_text']].copy()
+        
+        # Get numeric features (all columns except cleaned_text and label)
+        numeric_cols = [col for col in df.columns 
+                       if col not in ['cleaned_text', 'label'] 
+                       and pd.api.types.is_numeric_dtype(df[col])]
+        
+        # Fallback: if no numeric_cols detected (maybe dtype inference failed), take any non-text columns
+        if not numeric_cols:
+            numeric_cols = [col for col in df.columns if col not in ['cleaned_text', 'label']]
+        
+        numeric_features = df[numeric_cols].copy()
+        labels = df['label'].copy()
+        
+        # Data validation
+        self._validate_data(text_features, numeric_features, labels)
+        
+        print(f"✅ Data loaded successfully:")
+        print(f"   - Text samples: {len(text_features):,}")
+        print(f"   - Numeric features: {len(numeric_features.columns)}")
         try:
-            if filepath.suffix.lower() == '.csv':
-                df = pd.read_csv(filepath)
-            elif filepath.suffix.lower() == '.parquet':
-                df = pd.read_parquet(filepath)
-            elif filepath.suffix.lower() == '.json':
-                df = pd.read_json(filepath)
-            else:
-                print(f"  ⚠️  Skipping unsupported format: {filepath.name}")
-                return None, dataset_name, "Unsupported format"
+            print(f"   - Class distribution: {labels.value_counts().to_dict()}")
+            print(f"   - Phishing rate: {labels.mean():.2%}")
+        except Exception:
+            pass
+        
+        return text_features, numeric_features, labels
+    
+    def _validate_data(self, text_df: pd.DataFrame, numeric_df: pd.DataFrame, labels: pd.Series):
+        """Validate the loaded data"""
+        
+        # Check for empty text
+        empty_text = text_df['cleaned_text'].astype(str).str.strip().eq('').sum()
+        if empty_text > 0:
+            print(f"⚠️  Warning: {empty_text} emails have empty cleaned_text")
+        
+        # Check for duplicates
+        duplicates = text_df.duplicated().sum()
+        if duplicates > 0:
+            print(f"⚠️  Warning: {duplicates} duplicate emails found")
+        
+        # Check label distribution
+        try:
+            label_counts = labels.value_counts()
+            if len(label_counts) != 2:
+                print(f"⚠️  Warning: Expected binary labels, found {len(label_counts)} classes")
+        except Exception:
+            print("⚠️  Warning: Could not compute label distribution (labels may be non-numeric).")
+        
+        # Check for NaN values
+        text_nan = text_df.isna().sum().sum()
+        numeric_nan = numeric_df.isna().sum().sum()
+        labels_nan = labels.isna().sum() if hasattr(labels, 'isna') else 0
+        
+        if text_nan > 0 or numeric_nan > 0 or labels_nan > 0:
+            print(f"⚠️  Warning: Found NaN values - Text: {text_nan}, Numeric: {numeric_nan}, Labels: {labels_nan}")
 
-            df_standardized = self.standardize_columns(df, dataset_name)
-            if df_standardized is not None and len(df_standardized) >= CONFIG['min_dataset_size']:
-                return df_standardized, dataset_name, "Success"
-            elif df_standardized is not None:
-                return None, dataset_name, f"Too small ({len(df_standardized)} emails)"
-            else:
-                return None, dataset_name, "Standardization failed"
 
-        except Exception as e:
-            print(f"  ❌ Error loading {filepath.name}: {str(e)[:100]}")
-            return None, dataset_name, f"Error: {str(e)[:50]}"
-
-    def standardize_columns(self, df: pd.DataFrame, dataset_name: str) -> pd.DataFrame:
-        if df.empty:
-            return None
-
-        result = pd.DataFrame()
-        text_column = self.find_text_column(df)
-        if text_column is None:
-            print(f"    ❌ No text column found in {dataset_name}")
-            return None
-
-        label_column = self.find_label_column(df)
-        result['raw_email'] = df[text_column].astype(str)
-
-        if label_column is not None:
-            result['label'] = self.standardize_labels(df[label_column])
-        else:
-            print(f"    ⚠️  No label column in {dataset_name}, creating dummy labels")
-            result['label'] = np.random.choice([0, 1], size=len(df), p=[0.5, 0.5])
-
-        result['dataset_source'] = dataset_name
-        result = result[result['raw_email'].str.strip().str.len() > 10].copy()
-        return result
-
-    def find_text_column(self, df: pd.DataFrame) -> str:
-        text_candidates = [
-            'text', 'email', 'body', 'message', 'content', 'raw_email',
-            'email_text', 'email_body', 'raw_text', 'sentence', 'paragraph', 'document'
+# ==================== PIPELINE BUILDER ====================
+class ModelPipelineBuilder:
+    """Builds and configures the ML pipeline"""
+    
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+    
+    def build_pipeline(self, numeric_features: pd.DataFrame) -> Pipeline:
+        """
+        Build the complete ML pipeline.
+        
+        Args:
+            numeric_features: DataFrame of numeric features for column names
+        
+        Returns:
+            Configured scikit-learn Pipeline
+        """
+        print("\n🔧 Building ML pipeline...")
+        
+        # Get numeric feature names
+        numeric_feature_names = numeric_features.columns.tolist()
+        
+        # Create the TF-IDF vectorizer with safe parameters
+        tfidf_vectorizer = TfidfVectorizer(
+            max_features=self.config.TFIDF_MAX_FEATURES,
+            ngram_range=self.config.TFIDF_NGRAM_RANGE,
+            stop_words=self.config.TFIDF_STOP_WORDS,
+            min_df=self.config.TFIDF_MIN_DF,      # FIXED: Avoids "no terms remain"
+            max_df=self.config.TFIDF_MAX_DF,      # FIXED: Filters common terms
+            lowercase=True,                       # Already lowercase from preprocessing
+            analyzer='word',
+            token_pattern=r'(?u)\b\w\w+\b',       # Match words with 2+ chars
+            sublinear_tf=True                     # Use 1+log(tf)
+        )
+        
+        print(f"   TF-IDF Configuration:")
+        print(f"     - Max features: {self.config.TFIDF_MAX_FEATURES}")
+        print(f"     - N-gram range: {self.config.TFIDF_NGRAM_RANGE}")
+        print(f"     - Min DF: {self.config.TFIDF_MIN_DF}")
+        print(f"     - Max DF: {self.config.TFIDF_MAX_DF}")
+        print(f"     - Stop words: {self.config.TFIDF_STOP_WORDS}")
+        
+        # Create ColumnTransformer
+        column_transformer = ColumnTransformer([
+            ('tfidf', tfidf_vectorizer, 'cleaned_text'),
+            ('scaler', StandardScaler(), numeric_feature_names)
+        ])
+        
+        # Create Random Forest classifier
+        classifier = RandomForestClassifier(
+            n_estimators=self.config.N_ESTIMATORS,
+            random_state=self.config.RANDOM_STATE,
+            class_weight=self.config.CLASS_WEIGHT,
+            n_jobs=-1,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            bootstrap=True,
+            oob_score=True,
+            verbose=0
+        )
+        
+        print(f"   Random Forest Configuration:")
+        print(f"     - Number of trees: {self.config.N_ESTIMATORS}")
+        print(f"     - Class weight: {self.config.CLASS_WEIGHT}")
+        
+        # Build the pipeline
+        pipeline = Pipeline([
+            ('preprocessor', column_transformer),
+            ('classifier', classifier)
+        ])
+        
+        print("✅ Pipeline built successfully")
+        return pipeline
+    
+    def diagnose_tfidf_issues(self, text_data: pd.DataFrame):
+        """
+        Diagnostic function to check TF-IDF vocabulary issues.
+        
+        Args:
+            text_data: DataFrame with 'cleaned_text' column
+        """
+        print("\n🔍 Running TF-IDF diagnostics...")
+        
+        sample_texts = text_data['cleaned_text'].tolist()
+        
+        # Try different configurations
+        test_configs = [
+            {'min_df': 1, 'max_df': 1.0, 'name': 'No filtering'},
+            {'min_df': 1, 'max_df': 0.99, 'name': 'Very loose'},
+            {'min_df': 1, 'max_df': 0.95, 'name': 'Standard'},
+            {'min_df': 2, 'max_df': 0.95, 'name': 'Current config'},
         ]
-        for col in df.columns:
-            if col.lower() in [c.lower() for c in text_candidates]:
-                return col
-
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(keyword in col_lower for keyword in ['text', 'email', 'body', 'message', 'content']):
-                return col
-
-        string_cols = df.select_dtypes(include=['object']).columns
-        if len(string_cols) > 0:
-            avg_lengths = {}
-            for col in string_cols:
-                try:
-                    avg_len = df[col].astype(str).str.len().mean()
-                    avg_lengths[col] = avg_len
-                except Exception:
-                    continue
-            if avg_lengths:
-                return max(avg_lengths, key=avg_lengths.get)
-
-        if len(string_cols) > 0:
-            return string_cols[0]
-        return None
-
-    def find_label_column(self, df: pd.DataFrame) -> str:
-        label_candidates = [
-            'label', 'target', 'class', 'is_spam', 'is_phishing',
-            'spam', 'phishing', 'category', 'type', 'binary_label'
-        ]
-        for col in df.columns:
-            if col.lower() in [c.lower() for c in label_candidates]:
-                return col
-
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(keyword in col_lower for keyword in ['label', 'target', 'class', 'spam', 'phish']):
-                return col
-
-        for col in df.columns:
+        
+        for config in test_configs:
             try:
-                if df[col].nunique() == 2:
-                    return col
-            except Exception:
-                continue
-        return None
+                vectorizer = TfidfVectorizer(
+                    min_df=config['min_df'],
+                    max_df=config['max_df'],
+                    stop_words='english'
+                )
+                
+                # Try to build vocabulary
+                X = vectorizer.fit_transform(sample_texts)
+                vocab_size = len(vectorizer.get_feature_names_out())
+                
+                print(f"   {config['name']}: min_df={config['min_df']}, "
+                      f"max_df={config['max_df']} → Vocabulary: {vocab_size:,} terms")
+                
+                if vocab_size == 0:
+                    print(f"   ⚠️  WARNING: Zero vocabulary with this configuration!")
+                    
+            except Exception as e:
+                print(f"   ❌ {config['name']}: Failed with error - {str(e)[:100]}")
 
-    def standardize_labels(self, label_series: pd.Series) -> pd.Series:
-        labels = label_series.astype(str).str.lower().str.strip()
-        label_map = {}
-        unique_labels = labels.unique()
-        for label in unique_labels:
-            if label in ['0', 'false', 'no', 'ham', 'legitimate', 'safe', 'clean', 'normal']:
-                label_map[label] = 0
-            elif label in ['1', 'true', 'yes', 'spam', 'phishing', 'malicious', 'bad']:
-                label_map[label] = 1
-            elif 'ham' in label or 'legit' in label:
-                label_map[label] = 0
-            elif 'spam' in label or 'phish' in label:
-                label_map[label] = 1
-            else:
-                label_map[label] = 1
-        return labels.map(label_map)
+# ==================== MODEL TRAINER ====================
+class ModelTrainer:
+    """Handles model training and evaluation"""
+    
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+    
+    def train_and_evaluate(self, pipeline: Pipeline, X_train: pd.DataFrame, 
+                          X_test: pd.DataFrame, y_train: pd.Series, y_test: pd.Series) -> Dict[str, Any]:
+        """
+        Train the model and evaluate performance.
+        
+        Returns:
+            Dictionary with training metrics
+        """
+        print("\n🎯 Training model...")
+        
+        # Train the model
+        pipeline.fit(X_train, y_train)
+        print("✅ Model training complete")
+        
+        # Evaluate
+        metrics = self.evaluate_model(pipeline, X_test, y_test)
+        
+        # Feature importance analysis
+        self.analyze_feature_importance(pipeline, X_train)
+        
+        return metrics
+    
+    def evaluate_model(self, pipeline: Pipeline, X_test: pd.DataFrame,y_test: pd.Series) -> Dict[str, Any]:
+        """Evaluate model performance (robust to single-class training/test sets)."""
+        import math
 
-    def combine_datasets(self) -> pd.DataFrame:
-        print("\n📊 LOADING DATASETS")
-        print("=" * 60)
-        dataset_files = self.detect_datasets()
-        if not dataset_files:
-            print("❌ No datasets found in data/processed/")
-            return None
+        print("\n📊 Evaluating model performance...")
 
-        all_datasets = []
-        stats = []
-        for filepath in dataset_files[:CONFIG['max_datasets']]:
-            print(f"\n📂 Loading {filepath.name}...")
-            df_loaded, name, status = self.load_single_dataset(filepath)
-            if df_loaded is not None:
-                all_datasets.append(df_loaded)
-                legit_count = (df_loaded['label'] == 0).sum()
-                phish_count = (df_loaded['label'] == 1).sum()
-                stats.append({
-                    'dataset': name,
-                    'emails': len(df_loaded),
-                    'legitimate': legit_count,
-                    'phishing': phish_count,
-                    'phishing_pct': (phish_count / len(df_loaded) * 100)
-                })
-                print(f"   ✅ Loaded: {len(df_loaded)} emails ({phish_count} phishing, {phish_count/len(df_loaded)*100:.1f}%)")
-            else:
-                print(f"   ❌ Failed: {status}")
-
-        if not all_datasets:
-            print("\n❌ No valid datasets could be loaded")
-            return None
-
-        combined_df = pd.concat(all_datasets, ignore_index=True)
-        combined_df = combined_df.sample(frac=1, random_state=CONFIG['random_state']).reset_index(drop=True)
-
-        print("\n📈 DATASET SUMMARY")
-        print("=" * 60)
-        for stat in stats:
-            print(f"  {stat['dataset']:20}: {stat['emails']:5} emails, {stat['phishing']:4} phishing ({stat['phishing_pct']:5.1f}%)")
-
-        total_phishing = combined_df['label'].sum()
-        total_emails = len(combined_df)
-        print(f"\n  {'TOTAL':20}: {total_emails:5} emails, {total_phishing:4} phishing ({total_phishing/total_emails*100:.1f}%)")
-
-        print("\n  Dataset Sources:")
-        source_counts = combined_df['dataset_source'].value_counts()
-        for source, count in source_counts.items():
-            phishing_pct = combined_df[combined_df['dataset_source'] == source]['label'].mean() * 100
-            print(f"    {source:20}: {count:5} emails ({phishing_pct:.1f}% phishing)")
-
-        return combined_df
-
-
-# ------------------ Pipeline ------------------
-def create_full_pipeline(n_documents: int) -> Pipeline:
-    """Create the ML pipeline. n_documents is the number of training documents and used to adapt TF-IDF thresholds."""
-    print("\n🔧 BUILDING PIPELINE")
-    print("=" * 60)
-
-    def custom_preprocessor(X):
-        emails = X.tolist() if hasattr(X, 'tolist') else list(X)
-        text_df, features_df = preprocess_batch(emails)
-        return pd.concat([text_df, features_df], axis=1)
-
-    text_features = ['cleaned_text']
-    _, sample_features = preprocess_batch(["test email for feature extraction"])
-    numeric_features = sample_features.columns.tolist()
-
-    # Adaptive min_df / max_df
-    # Use integer document counts if dataset is small to avoid float->int rounding surprises
-    if n_documents < 50:
-        min_df = 1
-    else:
-        # require a token to appear in at least 1% of documents, but at least 2
-        min_df = max(2, int(max(1, np.round(0.01 * n_documents))))
-
-    # max_df_docs should be at least min_df
-    max_df_docs = max(min_df, int(np.floor(0.95 * n_documents)))
-    # If max_df_docs equals total docs (possible for tiny datasets), cap to n_documents
-    max_df_docs = min(max_df_docs, n_documents)
-
-    # If the computed max_df_docs < min_df (extremely small n_documents), set both to sensible values
-    if max_df_docs < min_df:
-        max_df_docs = min_df
-
-    # Use integer thresholds for safety
-    tfidf_min_df = min_df
-    tfidf_max_df = max_df_docs
-
-    print(f"  Training documents: {n_documents}")
-    print(f"  TF-IDF min_df (docs): {tfidf_min_df}")
-    print(f"  TF-IDF max_df (docs): {tfidf_max_df}")
-
-    column_transformer = ColumnTransformer([
-        ('tfidf', TfidfVectorizer(
-            max_features=CONFIG['tfidf_max_features'],
-            ngram_range=(1, 2),
-            stop_words='english',
-            min_df=tfidf_min_df,
-            max_df=tfidf_max_df
-        ), text_features),
-
-        ('scaler', StandardScaler(), numeric_features)
-    ], remainder='drop')
-
-    pipeline = Pipeline([
-        ('preprocessor', FunctionTransformer(custom_preprocessor, validate=False)),
-        ('transformer', column_transformer),
-        ('classifier', RandomForestClassifier(
-            n_estimators=CONFIG['n_estimators'],
-            random_state=CONFIG['random_state'],
-            class_weight='balanced',
-            n_jobs=-1
-        ))
-    ])
-
-    print("✅ Pipeline built successfully")
-    return pipeline
-
-
-# ------------------ Evaluation ------------------
-def evaluate_model(pipeline: Pipeline, X_test: pd.Series, y_test: pd.Series) -> Dict[str, Any]:
-    print("\n📊 MODEL EVALUATION")
-    print("=" * 60)
-    try:
+        # Predictions (labels)
         y_pred = pipeline.predict(X_test)
-        y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
 
-        accuracy = float(np.mean(y_pred == y_test))
-        roc_auc = float(roc_auc_score(y_test, y_pred_proba)) if len(np.unique(y_test)) > 1 else 0.0
-        f1 = float(f1_score(y_test, y_pred)) if len(np.unique(y_test)) > 1 else 0.0
+        # Safely get probability for the positive class (assumed label '1')
+        y_pred_proba = None
+        try:
+            prob_matrix = pipeline.predict_proba(X_test)
+            # Determine which column corresponds to positive label '1'
+            clf = pipeline.named_steps['classifier']
+            classes = getattr(clf, "classes_", None)
+            if classes is not None and 1 in classes:
+                pos_idx = int(np.where(classes == 1)[0][0])
+                # If prob_matrix has only one column and it's the positive class, ok
+                if prob_matrix.shape[1] > pos_idx:
+                    y_pred_proba = prob_matrix[:, pos_idx]
+                else:
+                    # Unexpected shape -- fall back to zeros
+                    y_pred_proba = np.zeros(len(X_test))
+            else:
+                # Positive class not seen during training -> probability for positive = 0
+                y_pred_proba = np.zeros(len(X_test))
+        except Exception:
+            # If predict_proba not available or failed, fall back to zeros
+            y_pred_proba = np.zeros(len(X_test))
 
-        tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        # Calculate accuracy and safe f1 (set zero_division to avoid exceptions)
+        accuracy = np.mean(y_pred == y_test)
+        try:
+            f1 = f1_score(y_test, y_pred, zero_division=0)
+        except Exception:
+            f1 = 0.0
 
-        print(f"  Accuracy:    {accuracy:.4f}")
-        print(f"  ROC-AUC:     {roc_auc:.4f}")
-        print(f"  F1-Score:    {f1:.4f}")
+        # Compute confusion matrix forcing labels [0,1] to guarantee 2x2 output
+        try:
+            cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel()
+        except Exception:
+            # Fallback: construct confusion from counts
+            tn = int(((y_test == 0) & (y_pred == 0)).sum())
+            fp = int(((y_test == 0) & (y_pred == 1)).sum())
+            fn = int(((y_test == 1) & (y_pred == 0)).sum())
+            tp = int(((y_test == 1) & (y_pred == 1)).sum())
 
-        print("\n  Confusion Matrix:")
-        print("                Predicted")
-        print("                Legit   Phishing")
-        print(f"    Actual Legit    {tn:4d}      {fp:4d}")
-        print(f"    Actual Phishing {fn:4d}      {tp:4d}")
-
-        print("\n  Classification Report:")
-        print(classification_report(y_test, y_pred, target_names=['Legitimate', 'Phishing']))
-
+        # Safe precision/recall calculation (avoid ZeroDivision)
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         false_positive_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
-        print("\n  Key Metrics:")
-        print(f"    Precision:           {precision:.4f}")
-        print(f"    Recall:              {recall:.4f}")
-        print(f"    False Positive Rate: {false_positive_rate:.4f}")
+        # Safe ROC-AUC: only compute if both classes present in y_test and proba array is valid
+        roc_auc = float('nan')
+        try:
+            if len(np.unique(y_test)) > 1 and y_pred_proba is not None:
+                roc_auc = float(roc_auc_score(y_test, y_pred_proba))
+            else:
+                roc_auc = float('nan')
+        except Exception:
+            roc_auc = float('nan')
+
+        # Print results
+        print(f"   📈 Performance Metrics:")
+        print(f"      Accuracy:           {accuracy:.4f}")
+        print(f"      ROC-AUC:            {roc_auc if not math.isnan(roc_auc) else 'N/A'}")
+        print(f"      F1-Score:           {f1:.4f}")
+        print(f"      Precision:          {precision:.4f}")
+        print(f"      Recall:             {recall:.4f}")
+        print(f"      False Positive Rate: {false_positive_rate:.4f}")
+
+        print(f"\n   🎯 Confusion Matrix:")
+        print(f"                 Predicted")
+        print(f"                 Legit   Phishing")
+        print(f"      Actual Legit    {tn:6d}      {fp:6d}")
+        print(f"      Actual Phishing {fn:6d}      {tp:6d}")
+
+        print(f"\n   📋 Classification Report:")
+        try:
+            print(classification_report(y_test, y_pred, target_names=['Legitimate', 'Phishing'], zero_division=0))
+        except Exception as e:
+            print(f"   ⚠️  Could not produce classification report: {e}")
 
         return {
-            'accuracy': accuracy,
-            'roc_auc': roc_auc,
-            'f1_score': f1,
+            'accuracy': float(accuracy),
+            'roc_auc': (roc_auc if not math.isnan(roc_auc) else None),
+            'f1_score': float(f1),
             'precision': float(precision),
             'recall': float(recall),
             'false_positive_rate': float(false_positive_rate),
             'confusion_matrix': [[int(tn), int(fp)], [int(fn), int(tp)]],
+            'test_samples': len(X_test),
             'evaluation_date': datetime.now().isoformat()
         }
 
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
-        return {}
+    
+    def analyze_feature_importance(self, pipeline: Pipeline, X_train: pd.DataFrame):
+        """Analyze feature importance if available"""
+        print("\n🔍 Analyzing feature importance...")
+        
+        try:
+            classifier = pipeline.named_steps['classifier']
+            
+            if hasattr(classifier, 'feature_importances_'):
+                # Get feature names
+                preprocessor = pipeline.named_steps['preprocessor']
+                
+                # Get TF-IDF feature names
+                tfidf_transformer = preprocessor.named_transformers_['tfidf']
+                if hasattr(tfidf_transformer, 'get_feature_names_out'):
+                    tfidf_features = tfidf_transformer.get_feature_names_out().tolist()
+                else:
+                    tfidf_features = [f"word_{i}" for i in range(tfidf_transformer.max_features)]
+                
+                # Get numeric feature names
+                numeric_features = [col for col in X_train.columns if col != 'cleaned_text']
+                
+                # Combine all features
+                all_features = tfidf_features + numeric_features
+                
+                # Get importances
+                importances = classifier.feature_importances_
+                
+                # Create importance DataFrame
+                importance_df = pd.DataFrame({
+                    'feature': all_features[:len(importances)],
+                    'importance': importances
+                }).sort_values('importance', ascending=False)
+                
+                # Filter by threshold
+                important_features = importance_df[
+                    importance_df['importance'] > self.config.MIN_FEATURE_IMPORTANCE
+                ]
+                
+                print(f"   Top 10 most important features:")
+                for idx, row in important_features.head(10).iterrows():
+                    print(f"      {row['feature']:30} : {row['importance']:.6f}")
+                
+                # Save feature importance
+                importance_path = self.config.MODEL_SAVE_PATH.parent / 'feature_importance.csv'
+                importance_df.to_csv(importance_path, index=False)
+                print(f"\n   💾 Feature importance saved to: {importance_path}")
+                
+        except Exception as e:
+            print(f"   ⚠️  Feature importance analysis skipped: {str(e)[:100]}")
 
-
-# ------------------ Training ------------------
-def train_model() -> Pipeline:
-    print("=" * 60)
-    print("🚀 PHISHING DETECTOR TRAINING")
-    print("=" * 60)
-
-    CONFIG['model_save_path'].parent.mkdir(parents=True, exist_ok=True)
-
-    loader = DatasetLoader(CONFIG['data_dir'])
-    combined_df = loader.combine_datasets()
-
-    if combined_df is None or len(combined_df) < 20:
-        print("\n❌ Insufficient data for training")
-        return None
-
-    X = combined_df['raw_email']
-    y = combined_df['label']
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=CONFIG['test_size'], random_state=CONFIG['random_state'], stratify=y
-    )
-
-    print(f"  Training set: {len(X_train):,} emails")
-    print(f"  Test set:     {len(X_test):,} emails")
-
-    # Create and train pipeline with adaptive TF-IDF thresholds
-    pipeline = create_full_pipeline(n_documents=len(X_train))
-
+# ==================== MAIN TRAINING WORKFLOW ====================
+def main_training_workflow() -> Optional[Pipeline]:
+    """
+    Main training workflow.
+    
+    Returns:
+        Trained pipeline if successful, None otherwise
+    """
+    print("=" * 70)
+    print("🤖 PROFESSIONAL PHISHING DETECTOR TRAINING")
+    print("=" * 70)
+    print(f"Project: {CONFIG.PROJECT_ROOT.name}")
+    print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    
     try:
-        pipeline.fit(X_train, y_train)
-        print("✅ Model trained successfully")
+        # Ensure model directory exists
+        CONFIG.MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Step 1: Load preprocessed data
+        data_loader = PreprocessedDataLoader(CONFIG.PREPROCESSED_DATA_PATH)
+        text_features, numeric_features, labels = data_loader.load_and_validate()
+        
+        # Combine features for train/test split
+        X = pd.concat([text_features, numeric_features], axis=1)
+        y = labels
+        
+        # Step 2: Split data
+        print(f"\n📊 Splitting data (test_size={CONFIG.TEST_SIZE})...")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=CONFIG.TEST_SIZE,
+            random_state=CONFIG.RANDOM_STATE,
+            stratify=y
+        )
+        
+        print(f"   Training set: {len(X_train):,} emails")
+        print(f"   Test set:     {len(X_test):,} emails")
+        print(f"   Phishing rate - Train: {y_train.mean():.2%}, Test: {y_test.mean():.2%}")
+        
+        # Step 3: Run TF-IDF diagnostics if needed
+        if CONFIG.TFIDF_MIN_DF > 1 or CONFIG.TFIDF_MAX_DF < 1.0:
+            pipeline_builder = ModelPipelineBuilder(CONFIG)
+            pipeline_builder.diagnose_tfidf_issues(X_train)
+        
+        # Step 4: Build pipeline
+        pipeline_builder = ModelPipelineBuilder(CONFIG)
+        pipeline = pipeline_builder.build_pipeline(numeric_features)
+        
+        # Step 5: Train and evaluate
+        trainer = ModelTrainer(CONFIG)
+        metrics = trainer.train_and_evaluate(pipeline, X_train, X_test, y_train, y_test)
+        
+        # Step 6: Save model and metrics
+        print(f"\n💾 Saving artifacts...")
+        
+        # Save model
+        joblib.dump(pipeline, CONFIG.MODEL_SAVE_PATH)
+        print(f"   ✅ Model saved to: {CONFIG.MODEL_SAVE_PATH}")
+        
+        # Save metrics
+        with open(CONFIG.METRICS_SAVE_PATH, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"   ✅ Metrics saved to: {CONFIG.METRICS_SAVE_PATH}")
+        
+        # Save training configuration
+        config_path = CONFIG.MODEL_SAVE_PATH.parent / 'training_config.json'
+        with open(config_path, 'w') as f:
+            json.dump(CONFIG.to_dict(), f, indent=2, default=str)
+        print(f"   ✅ Configuration saved to: {config_path}")
+        
+        # Step 7: Test with examples
+                # ---------------------------
+        # ---------------------------
+        print(f"\n🧪 Model testing with examples...")
+        test_examples = [
+            ("urgent verify your account now click http secure login com", 1),
+            ("hi team meeting at 3 pm tomorrow conference room", 0),
+        ]
+
+        correct = 0
+        for text, expected in test_examples:
+            test_df = pd.DataFrame({
+                'cleaned_text': [text],
+                **{col: [0] for col in numeric_features.columns}
+            })
+
+            # Prediction (label)
+            pred = pipeline.predict(test_df)[0]
+
+            # Safe probability for the positive class (label == 1)
+            try:
+                prob_matrix = pipeline.predict_proba(test_df)
+                clf = pipeline.named_steps['classifier']
+                classes = getattr(clf, "classes_", None)
+
+                if classes is not None and 1 in classes:
+                    pos_idx = int(np.where(classes == 1)[0][0])
+                    if prob_matrix.shape[1] > pos_idx:
+                        proba = float(prob_matrix[0, pos_idx])
+                    else:
+                        proba = 0.0
+                else:
+                    # Positive class not seen during training -> probability = 0
+                    proba = 0.0
+            except Exception:
+                # If predict_proba not available or failed, use 0.0
+                proba = 0.0
+
+            is_correct = pred == expected
+            if is_correct:
+                correct += 1
+
+            status = "✅" if is_correct else "❌"
+            print(f"   {status} '{text[:50]}...' → "
+                  f"Pred: {pred} ({proba:.1%}), Expected: {expected}")
+
+        print(f"\n   Test accuracy: {correct}/{len(test_examples)}")
+
+        
+                # Final summary
+        print("\n" + "=" * 70)
+        print("🎉 TRAINING COMPLETE!")
+        print("=" * 70)
+        print(f"\n📊 Final Model Performance:")
+
+        def _fmt(val, digits=4):
+            """Format numeric metric or return 'N/A' if None or not a number."""
+            try:
+                if val is None:
+                    return "N/A"
+                if isinstance(val, float) and np.isnan(val):
+                    return "N/A"
+                return f"{val:.{digits}f}"
+            except Exception:
+                return "N/A"
+
+        print(f"   Accuracy: {_fmt(metrics.get('accuracy'))}")
+        print(f"   ROC-AUC:  {_fmt(metrics.get('roc_auc'))}")
+        print(f"   F1-Score: {_fmt(metrics.get('f1_score'))}")
+
+
+
+        
+        print(f"\n🚀 Deployment Instructions:")
+        print(f"   1. Load model: model = joblib.load('{CONFIG.MODEL_SAVE_PATH.relative_to(CONFIG.PROJECT_ROOT)}')")
+        print(f"   2. Prepare input: DataFrame with columns: {list(numeric_features.columns)} + ['cleaned_text']")
+        print(f"   3. Predict: model.predict(new_data)")
+        
+        return pipeline
+        
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"\n❌ Training failed: {str(e)}")
+        import traceback
         traceback.print_exc()
         return None
 
-    metrics = evaluate_model(pipeline, X_test, y_test)
-
-    try:
-        joblib.dump(pipeline, CONFIG['model_save_path'])
-        print(f"✅ Model saved to: {CONFIG['model_save_path']}")
-        with open(CONFIG['metrics_save_path'], 'w') as f:
-            json.dump(metrics, f, indent=2)
-        print(f"✅ Metrics saved to: {CONFIG['metrics_save_path']}")
-
-        info = {
-            'training_date': datetime.now().isoformat(),
-            'datasets_used': combined_df['dataset_source'].unique().tolist(),
-            'total_samples': len(combined_df),
-            'training_samples': len(X_train),
-            'test_samples': len(X_test),
-            'model_parameters': {
-                'tfidf_max_features': CONFIG['tfidf_max_features'],
-                'n_estimators': CONFIG['n_estimators']
-            }
-        }
-        info_path = CONFIG['model_save_path'].parent / 'training_info.json'
-        with open(info_path, 'w') as f:
-            json.dump(info, f, indent=2)
-        print(f"✅ Training info saved to: {info_path}")
-
-    except Exception as e:
-        print(f"❌ Failed to save files: {e}")
-
-    return pipeline
-
-
-# ------------------ Test ------------------
-def test_model(pipeline: Pipeline):
-    print("\n🧪 MODEL TESTING")
-    print("=" * 60)
-    test_emails = [
-        ("URGENT: Your account will be suspended! Click http://phishing-site.com/verify now!", 1),
-        ("You won $10,000! Claim your prize at http://lottery-scam.com", 1),
-        ("SECURITY ALERT: Unusual login detected. Reset password: http://fake-security.com", 1),
-        ("Important: Verify your email address at http://verify-account.com", 1),
-        ("Hi team, meeting at 3 PM tomorrow in conference room B.", 0),
-        ("Please find the quarterly report attached to this email.", 0),
-        ("Reminder: Project deadline is next Friday.", 0),
-        ("Can you review this document when you have a moment?", 0),
-    ]
-
-    correct = 0
-    for i, (email, expected) in enumerate(test_emails, 1):
-        try:
-            prediction = pipeline.predict([email])[0]
-            proba = pipeline.predict_proba([email])[0][1]
-            is_correct = prediction == expected
-            if is_correct:
-                correct += 1
-                symbol = "✅"
-            else:
-                symbol = "❌"
-            print(f"  {symbol} Test {i}: {prediction} ({proba:.1%}) - Expected: {expected} - '{email[:50]}...'")
-        except Exception as e:
-            print(f"  ❌ Test {i} failed: {e}")
-
-    accuracy = correct / len(test_emails)
-    print(f"\n  Test Accuracy: {accuracy:.0%} ({correct}/{len(test_emails)})")
-
-
-# ------------------ Main ------------------
+# ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("🤖 AUTOMATIC PHISHING DETECTOR TRAINER (FIXED)")
-    print("=" * 60)
     print(f"Python {sys.version.split()[0]}")
     print(f"Working directory: {Path.cwd()}")
-    print(f"Data directory: {CONFIG['data_dir']}")
-
+    
     try:
-        model = train_model()
-        if model is not None:
-            test_model(model)
-            print("\n🔄 VERIFYING SAVED MODEL")
-            try:
-                loaded_model = joblib.load(CONFIG['model_save_path'])
-                _ = loaded_model.predict(["Test email for verification"])  # smoke test
-                print("✅ Saved model loads and predicts correctly")
-            except Exception as e:
-                print(f"❌ Failed to load saved model: {e}")
-
+        # Run the training workflow
+        trained_model = main_training_workflow()
+        
+        if trained_model is not None:
+            print("\n" + "=" * 70)
+            print("✅ All tasks completed successfully!")
+            print("=" * 70)
+        else:
+            print("\n" + "=" * 70)
+            print("❌ Training failed. Please check the error messages above.")
+            print("=" * 70)
+            sys.exit(1)
+            
     except KeyboardInterrupt:
         print("\n\n⚠️  Training interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        print(f"\n❌ Unexpected error: {str(e)}")
+        import traceback
         traceback.print_exc()
         sys.exit(1)
