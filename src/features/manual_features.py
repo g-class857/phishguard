@@ -1,191 +1,166 @@
-# Copyright 2020 The HuggingFace Datasets Authors and the current
-# dataset script contributor.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# TODO: Address all TODOs and remove all explanatory comments
-"""The SpamAssassin public mail corpus"""
-
-
-import email
-import email.policy
-import codecs
-import json
-import urllib.parse
-
-import datasets
-from .dep import ftfy, wcwidth
-
-
-# TODO: Add description of the dataset here
-# You can copy an official description
-_DESCRIPTION = """\
-Welcome to the SpamAssassin public mail corpus.  This is a selection of mail
-messages, suitable for use in testing spam filtering systems.  Pertinent
-points:
-
-  - All headers are reproduced in full.  Some address obfuscation has taken
-    place, and hostnames in some cases have been replaced with
-    "spamassassin.taint.org" (which has a valid MX record).  In most cases
-    though, the headers appear as they were received.
-
-  - All of these messages were posted to public fora, were sent to me in the
-    knowledge that they may be made public, were sent by me, or originated as
-    newsletters from public news web sites.
-
-  - relying on data from public networked blacklists like DNSBLs, Razor, DCC
-    or Pyzor for identification of these messages is not recommended, as a
-    previous downloader of this corpus might have reported them!
-
-  - Copyright for the text in the messages remains with the original senders.
-
-
-OK, now onto the corpus description.  It's split into three parts, as follows:
-
-  - spam: 500 spam messages, all received from non-spam-trap sources.
-
-  - easy_ham: 2500 non-spam messages.  These are typically quite easy to
-    differentiate from spam, since they frequently do not contain any spammish
-    signatures (like HTML etc).
-
-  - hard_ham: 250 non-spam messages which are closer in many respects to
-    typical spam: use of HTML, unusual HTML markup, coloured text,
-    "spammish-sounding" phrases etc.
-
-  - easy_ham_2: 1400 non-spam messages.  A more recent addition to the set.
-
-  - spam_2: 1397 spam messages.  Again, more recent.
-
-Total count: 6047 messages, with about a 31% spam ratio.
+"""
+manual_features.py
+Core preprocessing and feature extraction for phishing detection.
+Used identically in training and production (SOC-grade).
 """
 
-_HOMEPAGE = "https://spamassassin.apache.org/old/publiccorpus/readme.html"
+import re
+import html
+from typing import Tuple, Dict, List
+import pandas as pd
 
-_FILES = [
-    "20021010_easy_ham.tar.bz2",
-    "20021010_hard_ham.tar.bz2",
-    "20021010_spam.tar.bz2",
-    "20030228_easy_ham.tar.bz2",
-    "20030228_easy_ham_2.tar.bz2",
-    "20030228_hard_ham.tar.bz2",
-    "20030228_spam.tar.bz2",
-    "20030228_spam_2.tar.bz2",
-    "20050311_spam_2.tar.bz2",
-]
+# ==================== CORE PREPROCESSING FUNCTION ====================
+def preprocess_email(raw_email: str) -> Tuple[str, Dict[str, float]]:
+    """
+    Transforms a raw email into cleaned text + SOC-grade feature set.
+    """
 
+    # === 1. INITIAL CLEANING & DECODING ===
+    text = html.unescape(raw_email)
+    text = re.sub(r'=\s*\n', '', text)  # Remove soft line breaks
+    text = re.sub(r'=([A-F0-9]{2})', lambda m: chr(int(m.group(1), 16)), text)
 
-class MessageParser:
-    def __init__(self):
-        self.policy = email.policy.default.clone(
-            utf8=True,
-            refold_source='none')
+    features: Dict[str, float] = {}
 
-        def get_text(payload, charset):
-            try:
-                text = codecs.decode(payload, charset)
-                return ftfy.fix_encoding(text)
-            except UnicodeDecodeError:
-                pass
-            except LookupError:
-                pass
-            text, charset = ftfy.guess_bytes(payload)
-            return text
+    # === 2. URL & LINK FEATURES ===
+    url_pattern = r'https?://[^\s<>"\']+|www\.[^\s<>"\']+'
+    urls = re.findall(url_pattern, text, re.IGNORECASE)
 
-        self.get_text = get_text
+    features['num_links'] = len(urls)
+    features['has_url'] = 1.0 if urls else 0.0
 
-    def pick(self, msg):
-        # TODO: it might be worthwhile to include headers. They are
-        # certainly informative, but difficult to scrub of artifacts
-        # that would not generalize well.
-        if msg.is_multipart():
-            return [self.pick(part) for part in msg.get_payload()]
-        ct = msg.get_content_type()
-        if ct[:5] == "text/":
-            payload = msg.get_payload(decode=True)
-            charset = msg.get_param("charset", "utf-8")
-            return self.get_text(payload, charset)
-        return "…"
+    # Shortened URLs (SOC-grade)
+    features['has_short_url'] = 1.0 if re.search(
+        r'\b(bit\.ly|tinyurl|t\.co|goo\.gl|ow\.ly)\b',
+        text, re.IGNORECASE
+    ) else 0.0
 
-    def __call__(self, raw):
-        if b"Message-Id: <>" in raw:
-            # email.message seems to explode on MsgId "<>"
-            return None
-        msg = email.message_from_bytes(raw, policy=self.policy)
-        obj = self.pick(msg)
-        return json.dumps(obj, ensure_ascii=False)
+    # === 3. URGENCY & SOCIAL ENGINEERING ===
+    urgent_keywords = [
+        'urgent', 'immediate', 'asap', 'action required',
+        'verify', 'suspend', 'account', 'security', 'alert'
+    ]
+    urgent_pattern = r'\b(' + '|'.join(urgent_keywords) + r')\b'
 
+    features['has_urgent_keyword'] = 1.0 if re.search(
+        urgent_pattern, text, re.IGNORECASE
+    ) else 0.0
 
-class SpamAssassin(datasets.GeneratorBasedBuilder):
-    """SpamAssassin public mail corpus"""
+    # Imperative verbs (SOC signal)
+    features['num_imperative_verbs'] = len(re.findall(
+        r'\b(click|verify|confirm|update|login|reset|open|download)\b',
+        text, re.IGNORECASE
+    ))
 
-    VERSION = datasets.Version("0.1.0")
+    features['num_exclamations'] = text.count('!')
+    features['num_questions'] = text.count('?')
 
-    BUILDER_CONFIGS = [
-        datasets.BuilderConfig(
-            name="text",
-            version=VERSION,
-            description="Flattened mime data and normalized character sets",
-        ),
-        datasets.BuilderConfig(
-            name="unprocessed",
-            version=VERSION,
-            description="Raw original input files in binary",
-        ),
+    # === 4. FORMATTING & VISUAL TRICKS ===
+    features['has_html'] = 1.0 if re.search(r'<[^>]+>', text) else 0.0
+
+    words = re.findall(r'\b[A-Za-z]+\b', text)
+    all_caps_words = re.findall(r'\b[A-Z]{2,}\b', text)
+
+    features['all_caps_ratio'] = (
+        len(all_caps_words) / max(len(words), 1)
+    )
+
+    # === 5. STRUCTURAL FEATURES ===
+    features['body_length'] = len(text)
+
+    features['num_recipients'] = len(re.findall(
+        r'\b(To:|CC:|BCC:)\b', text, re.IGNORECASE
+    ))
+
+    features['has_attachment_keyword'] = 1.0 if re.search(
+        r'\b(attachment|attached|enclosed)\b',
+        text, re.IGNORECASE
+    ) else 0.0
+
+    # === 6. HEADER / BODY SPLIT ===
+    parts = re.split(r'\n\s*\n', text, maxsplit=1)
+    headers = parts[0] if parts else ''
+    body = parts[1] if len(parts) > 1 else headers
+
+    # Subject analysis
+    subject_match = re.search(
+        r'Subject:\s*(.*?)(?:\n|$)',
+        headers,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    subject = subject_match.group(1).strip() if subject_match else ''
+    features['subject_length'] = len(subject)
+    features['subject_has_urgent'] = 1.0 if re.search(
+        urgent_pattern, subject, re.IGNORECASE
+    ) else 0.0
+
+    # === 7. SENDER DOMAIN MISMATCH (SOC FEATURE) ===
+    from_match = re.search(r'From:.*?@([\w\.-]+)', headers, re.IGNORECASE)
+    sender_domain = from_match.group(1) if from_match else ''
+
+    link_domains = re.findall(
+        r'https?://([\w\.-]+)', text, re.IGNORECASE
+    )
+
+    features['domain_mismatch'] = 1.0 if (
+        sender_domain and any(
+            sender_domain not in d for d in link_domains
+        )
+    ) else 0.0
+
+    # === 8. LINK TEXT VS URL MISMATCH ===
+    features['link_mismatch'] = 1.0 if re.search(
+        r'<a\s+href="([^"]+)">([^<]+)</a>',
+        text, re.IGNORECASE
+    ) else 0.0
+
+    # === 9. CLEAN BODY FOR TF-IDF ===
+    body = re.sub(r'<script.*?</script>', ' ', body, flags=re.DOTALL | re.IGNORECASE)
+    body = re.sub(r'<style.*?</style>', ' ', body, flags=re.DOTALL | re.IGNORECASE)
+    body = re.sub(r'<[^>]+>', ' ', body)
+
+    body = re.sub(url_pattern, ' URL_TOKEN ', body, flags=re.IGNORECASE)
+    body = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', ' EMAIL_TOKEN ', body)
+    body = re.sub(r'\$\d+(?:\.\d{1,2})?', ' MONEY_TOKEN ', body)
+    body = re.sub(r'\b\d{10,}\b', ' NUMBER_TOKEN ', body)
+
+    body = re.sub(r'[^\w\s\.\,\!\?]', ' ', body)
+    body = ' '.join(body.split()).lower().strip()
+
+    cleaned_text = body if body else "empty_email"
+
+    return cleaned_text, features
+
+# ==================== BATCH PROCESSING ====================
+def preprocess_batch(raw_emails: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cleaned_texts = []
+    features_list = []
+
+    for email in raw_emails:
+        text, feats = preprocess_email(email)
+        cleaned_texts.append(text)
+        features_list.append(feats)
+
+    text_df = pd.DataFrame({'cleaned_text': cleaned_texts})
+    features_df = pd.DataFrame(features_list)
+
+    # Expected SOC-grade feature set
+    expected_features = [
+        'num_links', 'has_url', 'has_short_url',
+        'has_urgent_keyword', 'num_imperative_verbs',
+        'num_exclamations', 'num_questions',
+        'has_html', 'all_caps_ratio',
+        'body_length', 'num_recipients',
+        'has_attachment_keyword',
+        'subject_length', 'subject_has_urgent',
+        'domain_mismatch', 'link_mismatch'
     ]
 
-    DEFAULT_CONFIG_NAME = "text"
+    for feat in expected_features:
+        if feat not in features_df.columns:
+            features_df[feat] = 0.0
 
-    def _info(self):
-        if self.config.name == "unprocessed":
-            features = {'raw': datasets.Value(dtype='binary')}
-        else:
-            features = {'text': datasets.Value(dtype='string')}
-        return datasets.DatasetInfo(
-            description=_DESCRIPTION,
-            features=datasets.Features({
-                'label': datasets.ClassLabel(
-                    num_classes=2,
-                    names=['spam', 'ham']),
-                'group': datasets.Value(dtype='string'),
-                **features
-            }),
-            homepage=_HOMEPAGE,
-        )
+    features_df = features_df[expected_features]
 
-    def _split_generators(self, dl_manager):
-        srcs = [urllib.parse.urljoin(_HOMEPAGE, file) for file in _FILES]
-        srcs = [dl_manager.download(url) for url in srcs]
-        srcs = [dl_manager.iter_archive(path) for path in srcs]
-        return [datasets.SplitGenerator(
-            name=datasets.Split.TRAIN,
-            gen_kwargs={"srcs": srcs}
-        )]
-
-    def _extract_tars(self, src):
-        for arch in src:
-            for name, fh in arch:
-                group = name.split('/')[0]
-                label = 'ham' if 'ham' in group else 'spam'
-                yield dict(label=label, group=group, raw=fh.read())
-
-    def _parse_messages(self, src):
-        parser = MessageParser()
-        for row in src:
-            text = parser(row["raw"])
-            if text is not None:
-                yield dict(label=row["label"], group=row["group"], text=text)
-
-    def _generate_examples(self, srcs):
-        gen = self._extract_tars(srcs)
-        if self.config.name == "text":
-            gen = self._parse_messages(gen)
-        yield from enumerate(gen)
+    return text_df, features_df
