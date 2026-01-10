@@ -47,15 +47,20 @@ class TrainingConfig:
         self.CV_FOLDS = 5
         
         # TF-IDF parameters (FIXED: Adjusted to prevent "no terms remain" error)
-        self.TFIDF_MAX_FEATURES = 5000
-        self.TFIDF_NGRAM_RANGE = (1, 2)
+        self.TFIDF_MAX_FEATURES = 8000
+        self.TFIDF_NGRAM_RANGE = (1, 3)
         self.TFIDF_MIN_DF = 2          # Minimum document frequency
-        self.TFIDF_MAX_DF = 0.95       # Maximum document frequency
+        self.TFIDF_MAX_DF = 0.9       # Maximum document frequency
+        lowercase=True,
+        analyzer='word',
+        token_pattern=r'(?u)\b[a-zA-Z]{2,}\b',
+        sublinear_tf=True,
+        norm='l2'
         self.TFIDF_STOP_WORDS = 'english'
         
         # Model parameters
-        self.N_ESTIMATORS = 100
-        self.CLASS_WEIGHT = 'balanced'
+        self.N_ESTIMATORS = 300    # more trees = more stable 
+        self.CLASS_WEIGHT = {0: 1, 1: 2} # penalize phishing misses
         
         # Feature selection
         self.MIN_FEATURE_IMPORTANCE = 0.001
@@ -247,14 +252,15 @@ class ModelPipelineBuilder:
         classifier = RandomForestClassifier(
             n_estimators=self.config.N_ESTIMATORS,
             random_state=self.config.RANDOM_STATE,
-            class_weight=self.config.CLASS_WEIGHT,
+            class_weight=self.config.CLASS_WEIGHT, 
             n_jobs=-1,
-            max_depth=None,
-            min_samples_split=2,
-            min_samples_leaf=1,
+            max_depth=18,    # limits memorization
+            min_samples_split=10,     # prevents shallow splits
+            min_samples_leaf=5,    #smother decesion
             bootstrap=True,
             oob_score=True,
-            verbose=0
+            verbose=0,
+            max_features='sqrt'   #randomness improves generalization 
         )
         
         print(f"   Random Forest Configuration:")
@@ -346,7 +352,9 @@ class ModelTrainer:
         print("\n📊 Evaluating model performance...")
 
         # Predictions (labels)
-        y_pred = pipeline.predict(X_test)
+        y_proba = pipeline.predict_proba(X_test)[:, 1]
+        y_pred = (y_proba >= 0.35).astype(int)
+
 
         # Safely get probability for the positive class (assumed label '1')
         y_pred_proba = None
