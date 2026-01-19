@@ -64,9 +64,34 @@ LABEL_MAP = {
 }
 
 URGENT_WORDS = {
-    "urgent", "verify", "confirm", "action required",
-    "password", "login", "invoice", "payment", "suspend"
+    # Time pressure
+    "urgent", "immediately", "asap", "now", "today", "within 24 hours",
+    "limited time", "expires", "deadline", "final notice", "last chance",
+
+    # Account / security threat
+    "verify", "verification required", "confirm", "validate",
+    "suspended", "suspend", "locked", "blocked", "restricted",
+    "unauthorized", "unusual activity", "compromised",
+    "security alert", "account alert",
+
+    # Credential harvesting
+    "password", "login", "sign in", "sign-in", "reset password",
+    "update credentials", "re-authenticate",
+
+    # Financial pressure
+    "invoice", "payment", "paid", "overdue", "refund",
+    "billing", "wire transfer", "gift card",
+    "transaction", "purchase", "receipt",
+
+    # Authority & fear
+    "legal action", "court", "lawsuit", "law enforcement",
+    "irs", "tax", "penalty", "fine",
+
+    # Call-to-action phrases
+    "click below", "click here", "open attachment",
+    "download attached file", "review document"
 }
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -234,9 +259,12 @@ def build_features(subject: str,
         "domains": domains_field,
         # ip_urls 
         "ip_urls": sum(1 for u in urls if re.match(r"^https?://(?:\d{1,3}\.){3}\d{1,3}\b", u)),
+        "ip_urls": list(u for u in urls if re.match(r"^https?://(?:\d{1,3}\.){3}\d{1,3}\b", u)),
 
         # retained numeric SOC features
-        "urgent_words": sum(w in (body or "").lower() for w in URGENT_WORDS),
+        "urgent_words_count": sum(w in (body or "").lower() for w in URGENT_WORDS),
+        "urgent_words": list({w for w in URGENT_WORDS if w in ((subject or "") + " " + (body or "")).lower()}),
+        
         # exclamation_count removed per request
         "digit_ratio": sum(c.isdigit() for c in (body or "")) / max(len(body or ""), 1),
         "body_entropy": shannon_entropy(body or ""),
