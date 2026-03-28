@@ -37,7 +37,7 @@ MODEL_DIR.mkdir(exist_ok=True)
 
 MODEL_PATH = MODEL_DIR / "phishguard_xgb.json"
 METADATA_PATH = MODEL_DIR / "model_metadata.json"
-SHAP_BACKGROUND_PATH = ROOT / "xAI/shap_background.npy"
+SHAP_BACKGROUND_PATH = MODEL_DIR / "shap_background.npy"
 
 
 # ==========================================================
