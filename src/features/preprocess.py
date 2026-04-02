@@ -433,5 +433,89 @@ def main():
     combined.to_csv(output_path, index=False)
     logging.info("Finished in %.2fs. Total rows: %d", time.time() - start, len(combined))
 
+# =============================
+# PRODUCTION REAL-TIME FUNCTION
+# =============================
+def production_preprocessing(raw_email: str) -> Optional[Dict]:
+    """
+    Takes raw email string → returns processed feature dict (same format as training)
+    Used in predictor.py for real-time inference.
+    """
+
+    try:
+        msg = email.message_from_string(raw_email)
+    except Exception:
+        return None
+
+    subject = normalize(msg.get("Subject", ""))
+    sender = normalize(msg.get("From", ""))
+
+    body_parts = []
+    html_present = 0
+    attachments = []
+
+    for part in msg.walk():
+        try:
+            ctype = part.get_content_type()
+            disp = str(part.get_content_disposition() or "")
+            payload = part.get_payload(decode=True)
+
+            if not payload:
+                continue
+
+            try:
+                decoded = payload.decode("utf-8", errors="strict")
+            except UnicodeError:
+                decoded = payload.decode("latin-1", errors="ignore")
+
+            if ctype == "text/plain" and "attachment" not in disp:
+                body_parts.append(decoded)
+
+            elif ctype == "text/html":
+                html_present = 1
+                body_parts.append(
+                    BeautifulSoup(decoded, "html.parser").get_text(" ", strip=False)
+                )
+
+            if part.get_filename():
+                attachments.append(part.get_filename())
+
+        except Exception:
+            continue
+
+    body = normalize(" ".join(body_parts))
+    urls = safe_find_urls(body)
+
+    header_fields = {
+        "from_header": normalize(msg.get("From", "")),
+        "to_header": normalize(msg.get("To", "")),
+        "recipient": normalize(msg.get("Delivered-To", "") or msg.get("To", "")),
+        "return_path": normalize(msg.get("Return-Path", "")),
+        "message_id": normalize(msg.get("Message-ID", "")),
+        "x_mailer": normalize(msg.get("X-Mailer", "")),
+        "x_originating_ip": normalize(msg.get("X-Originating-IP", "")),
+        "content_type": normalize(msg.get("Content-Type", "")),
+    }
+
+    headers_text = "\n".join(f"{k}: {v}" for k, v in msg.items())
+    auth_info = parse_auth_from_headers(headers_text)
+
+    
+    features = build_features(
+        subject, body, sender, urls,
+        html_present, attachments,
+        label=-1,# because this is inference
+        auth_info=auth_info,
+        header_fields=header_fields
+    )
+
+    return features
+    
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "prod":
+        raw_email = sys.stdin.read()
+        result = production_preprocessing(raw_email)
+        print(result)
+    else:
+        main()
+
